@@ -20,6 +20,7 @@ Pasos:
 Solo usa la biblioteca estándar de Python.
 """
 import argparse
+import re
 import hashlib
 import json
 import os
@@ -163,15 +164,22 @@ def smoke_test(binary, source, arch, work):
     if model.stat().st_size != TEST_MODEL_SIZE or sha256_of(model) != TEST_MODEL_SHA256:
         raise RuntimeError("El modelo de prueba no coincide con el hash fijado.")
     sample = source / "samples" / "jfk.wav"
-    attempts = (("con aceleración (o CPU si no hay GPU)", []), ("forzando CPU", ["-ng"]))
-    for label, extra in attempts:
-        result = subprocess.run(prefix + [str(binary), "-m", str(model), "-f", str(sample), "-nt", "-np"] + extra,
+    for forced_cpu in (False, True):
+        extra = ["-ng"] if forced_cpu else []
+        # Sin -np: whisper informa qué backend usó ("using Vulkan0 backend" o "no GPU found").
+        result = subprocess.run(prefix + [str(binary), "-m", str(model), "-f", str(sample), "-nt"] + extra,
                                 capture_output=True, timeout=600, cwd=str(binary.parent))
         text = (result.stdout + result.stderr).decode("utf-8", "replace")
+        if forced_cpu:
+            label = "CPU forzada (-ng)"
+        else:
+            used = re.search(r"using (\S+) backend", text)
+            label = (f"GPU ({used.group(1)})" if used and not used.group(1).upper().startswith("CPU")
+                     else "CPU (la máquina no tiene GPU)")
         if result.returncode == 0 and TEST_PHRASE in text.lower().replace(",", ""):
-            log(f"Prueba de transcripción correcta ({label}).")
+            log(f"Prueba de transcripción correcta: {label}.")
             return label
-        log(f"Prueba {label} sin éxito (código {result.returncode}):\n{text[-1500:]}")
+        log(f"Prueba sin éxito ({label}, código {result.returncode}):\n{text[-1500:]}")
     raise RuntimeError("whisper-cli no pudo transcribir el audio de prueba.")
 
 
