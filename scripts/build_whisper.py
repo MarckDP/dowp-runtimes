@@ -174,8 +174,13 @@ def smoke_test(binary, source, arch, work):
             label = "CPU forzada (-ng)"
         else:
             used = re.search(r"using (\S+) backend", text)
-            label = (f"GPU ({used.group(1)})" if used and not used.group(1).upper().startswith("CPU")
-                     else "CPU (la máquina no tiene GPU)")
+            name = used.group(1) if used else ""
+            if name.upper().startswith("BLAS"):
+                label = "CPU (BLAS/Accelerate)"   # BLAS acelera en la CPU, no es una GPU
+            elif name and not name.upper().startswith("CPU"):
+                label = f"GPU ({name})"
+            else:
+                label = "CPU (la máquina no tiene GPU)"
         if result.returncode == 0 and TEST_PHRASE in text.lower().replace(",", ""):
             log(f"Prueba de transcripción correcta: {label}.")
             return label
