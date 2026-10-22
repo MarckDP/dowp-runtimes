@@ -1,0 +1,221 @@
+name: whisper.cpp
+
+# Compila whisper-cli (código oficial de ggml-org/whisper.cpp, sin modificar) para el
+# hardware que no cubren los paquetes oficiales, y lo publica con su SHA-256 para que DowP
+# lo descargue. Se lanza a mano desde la pestaña Actions ("Run workflow").
+#
+# Las máquinas de GitHub no tienen GPU utilizable: cada paquete se prueba transcribiendo
+# un audio de ejemplo (por CPU si no hay GPU; en Linux, con Vulkan por software). La
+# aceleración real la prueban personas con ese hardware.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión de whisper.cpp (ej. v1.9.5) o 'latest' para la última estable"
+        required: true
+        default: latest
+      windows_vulkan:
+        description: "Windows x64 · Vulkan (AMD, Intel y también NVIDIA)"
+        type: boolean
+        default: true
+      macos_arm64_metal:
+        description: "macOS Apple Silicon · Metal"
+        type: boolean
+        default: true
+      macos_x64:
+        description: "macOS Intel · CPU con Accelerate"
+        type: boolean
+        default: true
+      linux_x64_vulkan:
+        description: "Linux x64 · Vulkan"
+        type: boolean
+        default: true
+      windows_cuda:
+        description: "Windows x64 · CUDA 12.8 (para RTX serie 50; tarda bastante)"
+        type: boolean
+        default: false
+      publish:
+        description: "Publicar una release con los paquetes (si no, quedan solo como artifacts)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# Una compilación a la vez: dos publicaciones simultáneas no aportan nada.
+concurrency:
+  group: whisper-build
+  cancel-in-progress: false
+
+env:
+  VULKAN_SDK_VERSION: "1.4.363.0"
+  CUDA_VERSION: "12.8.1"
+
+jobs:
+  plan:
+    name: Planificar
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          WINDOWS_VULKAN: ${{ inputs.windows_vulkan }}
+          MACOS_ARM64_METAL: ${{ inputs.macos_arm64_metal }}
+          MACOS_X64: ${{ inputs.macos_x64 }}
+          LINUX_X64_VULKAN: ${{ inputs.linux_x64_vulkan }}
+          WINDOWS_CUDA: ${{ inputs.windows_cuda }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          version = os.environ["INPUT_VERSION"].strip() or "latest"
+          if version == "latest":
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest",
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "User-Agent": "dowp-runtimes"})
+              version = json.load(urllib.request.urlopen(request))["tag_name"]
+          if not re.fullmatch(r"v?\d+\.\d+\.\d+", version):
+              raise SystemExit(f"Versión no reconocida: {version}")
+          targets = [
+              ("WINDOWS_VULKAN", {"id": "windows-x64-vulkan", "runner": "windows-2022", "backend": "vulkan", "arch": "x64"}),
+              ("MACOS_ARM64_METAL", {"id": "macos-arm64-metal", "runner": "macos-15", "backend": "metal", "arch": "arm64"}),
+              ("MACOS_X64", {"id": "macos-x64-cpu", "runner": "macos-15", "backend": "cpu", "arch": "x86_64"}),
+              ("LINUX_X64_VULKAN", {"id": "linux-x64-vulkan", "runner": "ubuntu-22.04", "backend": "vulkan", "arch": "x64"}),
+              ("WINDOWS_CUDA", {"id": "windows-x64-cuda", "runner": "windows-2022", "backend": "cuda", "arch": "x64"}),
+          ]
+          include = [target for key, target in targets if os.environ.get(key) == "true"]
+          if not include:
+              raise SystemExit("No se eligió ningún destino.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+              output.write("matrix=" + json.dumps({"include": include}) + "\n")
+          print("whisper.cpp", version, "->", ", ".join(t["id"] for t in include))
+          PY
+
+  build:
+    name: ${{ matrix.id }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── Vulkan ───────────────────────────────────────────────────────────────────
+      - name: Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $v = $env:VULKAN_SDK_VERSION
+          $installer = "$env:RUNNER_TEMP\vulkansdk.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe" -OutFile $installer
+          $root = "C:\VulkanSDK\$v"
+          Start-Process -FilePath $installer -Wait -NoNewWindow `
+            -ArgumentList "--root", $root, "--accept-licenses", "--default-answer", "--confirm-command", "install"
+          if (-not (Test-Path "$root\Bin\glslc.exe")) { throw "No se instaló el Vulkan SDK (falta glslc)." }
+          "VULKAN_SDK=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$root\Bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Vulkan SDK (Linux)
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        run: |
+          v="$VULKAN_SDK_VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/vulkansdk.tar.xz" \
+            "https://sdk.lunarg.com/sdk/download/$v/linux/vulkansdk-linux-x86_64-$v.tar.xz"
+          mkdir -p "$RUNNER_TEMP/vulkansdk"
+          tar -xJf "$RUNNER_TEMP/vulkansdk.tar.xz" -C "$RUNNER_TEMP/vulkansdk"
+          sdk="$RUNNER_TEMP/vulkansdk/$v/x86_64"
+          test -x "$sdk/bin/glslc" || { echo "No se encontró glslc en el Vulkan SDK"; exit 1; }
+          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/bin" >> "$GITHUB_PATH"
+          # Cargador de Vulkan y lavapipe (Vulkan por software de Mesa): así la prueba
+          # ejecuta de verdad el backend Vulkan aunque la máquina no tenga GPU.
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+
+      # ── CUDA (opcional) ──────────────────────────────────────────────────────────
+      - name: CUDA Toolkit (Windows)
+        if: matrix.backend == 'cuda'
+        shell: pwsh
+        run: |
+          $v = $env:CUDA_VERSION
+          $mm = ($v -split '\.')[0..1] -join '.'
+          $installer = "$env:RUNNER_TEMP\cuda.exe"
+          Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/$v/network_installers/cuda_${v}_windows_network.exe" -OutFile $installer
+          $components = @("nvcc_$mm", "cudart_$mm", "cublas_$mm", "cublas_dev_$mm", "thrust_$mm", "crt_$mm",
+                          "visual_studio_integration_$mm")
+          Start-Process -FilePath $installer -ArgumentList (@("-s") + $components) -Wait -NoNewWindow
+          $path = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$mm"
+          if (-not (Test-Path "$path\bin\nvcc.exe")) { throw "No se instaló CUDA (falta nvcc)." }
+          # Integración con Visual Studio, por si el instalador no la copió.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Copy-Item "$path\extras\visual_studio_integration\MSBuildExtensions\*" "$vs\MSBuild\Microsoft\VC\v170\BuildCustomizations" -Force
+          "CUDA_PATH=$path" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$path\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "DOWP_CUDA_VERSION=$mm" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # ── macOS Intel ──────────────────────────────────────────────────────────────
+      - name: Rosetta (para probar el paquete Intel en una Mac ARM)
+        if: runner.os == 'macOS' && matrix.arch == 'x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      # ── Compilar, probar y empaquetar ────────────────────────────────────────────
+      - name: Compilar, probar y empaquetar
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python scripts/build_whisper.py
+          --version "${{ needs.plan.outputs.version }}"
+          --backend "${{ matrix.backend }}"
+          --arch "${{ matrix.arch }}"
+          --output dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.id }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publicar
+    needs: [plan, build]
+    # También si algún destino falló: se publica lo que sí salió (las notas lo dicen).
+    if: ${{ always() && inputs.publish && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Manifiesto, sumas y notas
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: >
+          python3 scripts/make_release.py dist
+          "${{ needs.plan.outputs.version }}" "${{ github.run_number }}"
+          "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Crear la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt dist/manifest.json)
+          tag="whisper-${{ needs.plan.outputs.version }}-r${{ github.run_number }}"
+          gh release create "$tag" "${files[@]}" \
+            --repo "${{ github.repository }}" \
+            --title "whisper.cpp ${{ needs.plan.outputs.version }} · compilación ${{ github.run_number }}" \
+            --notes-file dist/RELEASE_NOTES.md
